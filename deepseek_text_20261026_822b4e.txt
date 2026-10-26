@@ -1,0 +1,6 @@
+ai-podcast-generator/
+├── .env.example
+├── .gitignore
+├── requirements.txt
+├── README.md
+└── podcast_generator.py

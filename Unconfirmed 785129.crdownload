@@ -1,0 +1,235 @@
+"""
+AI Podcast Generator
+--------------------
+Pipeline: Research & Script (Gemini) -> Multi-speaker TTS (Sarvam Bulbul) -> Audio assembly (pydub)
+
+Secrets are loaded from .env at startup. Never hardcode or print API keys.
+"""
+
+import os
+import sys
+import json
+import base64
+import logging
+from typing import List, Dict
+
+from dotenv import load_dotenv
+from pydub import AudioSegment
+from pydub.generators import WhiteNoise
+
+import google.generativeai as genai
+from sarvamai import SarvamAI
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("podcast_generator")
+
+
+# ---------------------------------------------------------------------------
+# Environment / secrets (loaded once, validated, never printed)
+# ---------------------------------------------------------------------------
+load_dotenv()
+
+
+def _load_required_env(name: str) -> str:
+    """Read a required env var. Fails fast. Never logs the value."""
+    value = os.getenv(name)
+    if not value or not value.strip():
+        raise RuntimeError(
+            f"Missing required environment variable: {name}. "
+            f"Add it to your .env file (see .env.example)."
+        )
+    return value.strip()
+
+
+SARVAM_API_KEY = _load_required_env("SARVAM_API_KEY")
+GEMINI_API_KEY = _load_required_env("GEMINI_API_KEY")
+
+# Bind keys to SDK clients ONCE. Keys are not referenced anywhere else.
+sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Podcast Generator
+# ---------------------------------------------------------------------------
+class PodcastGenerator:
+    """Generates a complete multi-speaker podcast from a topic prompt."""
+
+    # Map script roles -> Sarvam Bulbul speaker IDs.
+    # Adjust to any persona IDs available in your Sarvam catalog.
+    VOICE_MAP = {
+        "A": "shubh_en_social",     # energetic host
+        "B": "aparna_en_companion", # expert/empathetic host
+    }
+
+    def __init__(self, model_name: str = "gemini-2.0-flash"):
+        self.model = genai.GenerativeModel(model_name)
+        self.tts = sarvam_client.text_to_speech
+
+    # ------------------------------------------------------------------
+    # 1. Research + Script
+    # ------------------------------------------------------------------
+    def research_and_script(self, topic: str, duration_min: int = 5) -> List[Dict[str, str]]:
+        """
+        Generate a structured podcast script as a list of dialogue turns:
+        [{"speaker": "A", "text": "..."}, ...]
+        """
+        prompt = f"""
+        You are a professional podcast producer. Create a natural, engaging dialogue
+        script about: "{topic}".
+
+        Requirements:
+        1. Two hosts: Host A (curious, energetic) and Host B (expert, analytical).
+        2. Roughly {duration_min} minutes when spoken (~150 words/min).
+        3. Include a brief intro, 3 main discussion points, and a conclusion.
+        4. Output ONLY a valid JSON list of objects with keys: "speaker" (A or B) and "text".
+        5. Make it sound human: interruptions, agreements ("Right", "Exactly"),
+           transitions, natural pacing.
+
+        Example:
+        [{{"speaker": "A", "text": "Welcome back to the show..."}},
+         {{"speaker": "B", "text": "Thanks for having me..."}}]
+        """
+
+        logger.info("Generating script for topic: %s", topic)
+        response = self.model.generate_content(prompt)
+
+        content = response.text.replace("```json", "").replace("```", "").strip()
+        try:
+            script = json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse script JSON: %s", e)
+            return []
+
+        if not isinstance(script, list) or not script:
+            logger.error("Script is empty or not a list.")
+            return []
+
+        logger.info("Script ready with %d turns.", len(script))
+        return script
+
+    # ------------------------------------------------------------------
+    # 2. Per-turn TTS via Sarvam Bulbul
+    # ------------------------------------------------------------------
+    def _generate_audio_segment(self, text: str, speaker_id: str, output_path: str) -> bool:
+        """Call Sarvam Bulbul for one dialogue turn and write a WAV file."""
+        try:
+            audio_response = self.tts.convert(
+                text=text,
+                model="bulbul:v4-flash",
+                language_code="en-IN",
+                speaker=speaker_id,
+                pace=1.0,
+                speech_sample_rate=24000,
+            )
+            audio_bytes = base64.b64decode("".join(audio_response.audios))
+            with open(output_path, "wb") as f:
+                f.write(audio_bytes)
+            return True
+        except Exception as e:
+            logger.error("TTS failed for speaker %s: %s", speaker_id, e)
+            return False
+
+    # ------------------------------------------------------------------
+    # 3. Assemble final podcast
+    # ------------------------------------------------------------------
+    def assemble_podcast(
+        self,
+        script: List[Dict[str, str]],
+        output_file: str = "episode.mp3",
+        background_music_path: str | None = None,
+    ) -> None:
+        """
+        Generate TTS per turn, pan speakers L/R, add pauses, mix optional
+        background music, and export the final MP3.
+        """
+        segments: List[AudioSegment] = []
+
+        logger.info("Synthesizing %d dialogue turns...", len(script))
+        for i, turn in enumerate(script):
+            speaker = turn.get("speaker", "A")
+            text = turn.get("text", "").strip()
+            if not text:
+                continue
+
+            voice_id = self.VOICE_MAP.get(speaker, self.VOICE_MAP["A"])
+            temp_file = f"temp_{i}.wav"
+
+            if not self._generate_audio_segment(text, voice_id, temp_file):
+                logger.warning("Skipping turn %d (TTS failed).", i)
+                continue
+
+            seg = AudioSegment.from_wav(temp_file)
+            seg = seg.pan(-0.3 if speaker == "A" else 0.3)
+            segments.append(seg + AudioSegment.silent(duration=400))
+
+            try:
+                os.remove(temp_file)
+            except OSError:
+                pass
+
+        if not segments:
+            logger.error("No audio segments generated. Aborting.")
+            return
+
+        full_speech = AudioSegment.empty()
+        for seg in segments:
+            full_speech += seg
+
+        # --- Background music ---
+        if background_music_path and os.path.exists(background_music_path):
+            logger.info("Mixing background music: %s", background_music_path)
+            music = AudioSegment.from_file(background_music_path)
+            # Loop/trim to speech length and drop volume
+            if len(music) < len(full_speech):
+                loops = (len(full_speech) // len(music)) + 1
+                music = music * loops
+            music = music[: len(full_speech)] - 20  # -20 dB
+            combined = full_speech.overlay(music)
+        else:
+            logger.info("No background music provided; mixing quiet ambience.")
+            ambience = WhiteNoise().to_audio_segment(
+                duration=len(full_speech), volume=-35
+            )
+            combined = full_speech.overlay(ambience)
+
+        combined = combined.fade_in(2000).fade_out(3000)
+        combined.export(output_file, format="mp3", bitrate="192k")
+        logger.info("✅ Podcast exported: %s", output_file)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Usage: python podcast_generator.py \"<topic>\" [duration_min] [bg_music.mp3]")
+        return 1
+
+    topic = sys.argv[1]
+    duration = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    bg_music = sys.argv[3] if len(sys.argv) > 3 else None
+
+    generator = PodcastGenerator()
+    script = generator.research_and_script(topic, duration_min=duration)
+    if not script:
+        logger.error("Script generation failed. Exiting.")
+        return 2
+
+    generator.assemble_podcast(
+        script,
+        output_file="episode.mp3",
+        background_music_path=bg_music,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

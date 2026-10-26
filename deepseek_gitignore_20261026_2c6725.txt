@@ -1,0 +1,23 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+env/
+
+# Generated audio / temp files
+*.mp3
+*.wav
+temp_*.wav
+demo_episode.mp3
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
